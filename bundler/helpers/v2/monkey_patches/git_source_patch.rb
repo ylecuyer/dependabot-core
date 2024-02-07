@@ -17,7 +17,6 @@ module Bundler
         end
 
         def configured_uri_for(uri)
-          require 'bundler/vendor/uri/lib/uri'
           uri = uri.gsub(%r{git@(.*?):/?}, 'https://\1/')
           if /https?:/.match?(uri)
             remote = Bundler::URI(uri)
