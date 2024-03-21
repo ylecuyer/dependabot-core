@@ -1,4 +1,4 @@
-# typed: strict
+# typed: strong
 # frozen_string_literal: true
 
 require "nokogiri"
@@ -44,6 +44,16 @@ module Dependabot
           Dependabot.logger.warn "Dependency '#{d.name}' excluded due to unparsable version: #{d.version}"
         end
 
+        dependency_info = dependencies.map do |d|
+          requirements_info = d.requirements.filter_map { |r| "    file: #{r[:file]}, metadata: #{r[:metadata]}" }
+                               .join("\n")
+          "  name: #{d.name}, version: #{d.version}\n#{requirements_info}"
+        end.join("\n")
+
+        if dependencies.length.positive?
+          Dependabot.logger.info "The following dependencies were found:\n#{dependency_info}"
+        end
+
         dependencies
       end
 
@@ -77,14 +87,14 @@ module Dependabot
       def global_json_dependencies
         return DependencySet.new unless global_json
 
-        GlobalJsonParser.new(global_json: global_json).dependency_set
+        GlobalJsonParser.new(global_json: T.must(global_json)).dependency_set
       end
 
       sig { returns(Dependabot::FileParsers::Base::DependencySet) }
       def dotnet_tools_json_dependencies
         return DependencySet.new unless dotnet_tools_json
 
-        DotNetToolsJsonParser.new(dotnet_tools_json: dotnet_tools_json).dependency_set
+        DotNetToolsJsonParser.new(dotnet_tools_json: T.must(dotnet_tools_json)).dependency_set
       end
 
       sig { returns(Dependabot::Nuget::FileParser::ProjectFileParser) }
