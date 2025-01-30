@@ -75,7 +75,7 @@ module Dependabot
           releases_with_dependency_name =
             releases
             .reject { |r| r.tag_name.nil? }
-            .select { |r| r.tag_name.downcase.include?(dep_prefix) }
+            .select { |r| r.tag_name.start_with?(dep_prefix) }
 
           return releases unless releases_with_dependency_name.any?
 
@@ -242,7 +242,7 @@ module Dependabot
           when "github" then fetch_github_releases
           # Bitbucket and CodeCommit don't support releases and
           # Azure can't list API for annotated tags
-          when "bitbucket", "azure", "codecommit" then []
+          when "bitbucket", "azure", "codecommit", "example" then []
           when "gitlab" then fetch_gitlab_releases
           else raise "Unexpected repo provider '#{T.must(source).provider}'"
           end
@@ -302,7 +302,7 @@ module Dependabot
 
           # Previous version looks like a git SHA and there's a previous ref, we
           # could be changing to a nil previous ref in which case we want to
-          # fall back to tge sha version
+          # fall back to the sha version
           if T.must(dependency.previous_version).match?(/^[0-9a-f]{40}$/) &&
              ref_changed? && previous_ref
             previous_ref

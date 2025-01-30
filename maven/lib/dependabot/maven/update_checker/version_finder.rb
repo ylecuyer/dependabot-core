@@ -78,8 +78,12 @@ module Dependabot
 
         private
 
-        attr_reader :dependency, :dependency_files, :credentials,
-                    :ignored_versions, :forbidden_urls, :security_advisories
+        attr_reader :dependency
+        attr_reader :dependency_files
+        attr_reader :credentials
+        attr_reader :ignored_versions
+        attr_reader :forbidden_urls
+        attr_reader :security_advisories
 
         sig { params(possible_versions: T::Array[T.untyped]).returns(T::Array[T.untyped]) }
         def filter_prereleases(possible_versions)
@@ -199,8 +203,18 @@ module Dependabot
         rescue URI::InvalidURIError
           nil
         rescue Excon::Error::Socket, Excon::Error::Timeout,
-               Excon::Error::TooManyRedirects
-          raise if central_repo_urls.include?(repository_details["url"])
+               Excon::Error::TooManyRedirects => e
+
+          if central_repo_urls.include?(repository_details["url"])
+            response_status = response&.status || 0
+            response_body = if response
+                              "RegistryError: #{response.status} response status with body #{response.body}"
+                            else
+                              "RegistryError: #{e.message}"
+                            end
+
+            raise RegistryError.new(response_status, response_body)
+          end
 
           nil
         end
