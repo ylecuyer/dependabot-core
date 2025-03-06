@@ -25,4 +25,6 @@ dependabot \
   -v "$(pwd)"/python:/home/dependabot/python \
   -v "$(pwd)"/swift:/home/dependabot/swift \
   -v "$(pwd)"/terraform:/home/dependabot/terraform \
+  -v "$(pwd)"/bun:/home/dependabot/bun \
+  -v "$(pwd)"/uv:/home/dependabot/uv \
   "$@"

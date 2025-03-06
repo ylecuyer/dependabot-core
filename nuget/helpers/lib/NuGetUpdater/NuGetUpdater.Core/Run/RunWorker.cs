@@ -3,6 +3,7 @@ using System.Net;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Text.RegularExpressions;
 
 using Microsoft.Extensions.FileSystemGlobbing;
 
@@ -11,6 +12,9 @@ using NuGet.Versioning;
 using NuGetUpdater.Core.Analyze;
 using NuGetUpdater.Core.Discover;
 using NuGetUpdater.Core.Run.ApiModel;
+using NuGetUpdater.Core.Utilities;
+
+using static NuGetUpdater.Core.Utilities.EOLHandling;
 
 namespace NuGetUpdater.Core.Run;
 
@@ -116,14 +120,13 @@ public class RunWorker
         var discoveredUpdatedDependencies = GetUpdatedDependencyListFromDiscovery(discoveryResult, repoContentsPath.FullName);
         await _apiHandler.UpdateDependencyList(discoveredUpdatedDependencies);
 
+        var incrementMetric = GetIncrementMetric(job);
+        await _apiHandler.IncrementMetric(incrementMetric);
+
         // TODO: pull out relevant dependencies, then check each for updates and track the changes
         var originalDependencyFileContents = new Dictionary<string, string>();
+        var originalDependencyFileEOFs = new Dictionary<string, EOLType>();
         var actualUpdatedDependencies = new List<ReportedDependency>();
-        await _apiHandler.IncrementMetric(new()
-        {
-            Metric = "updater.started",
-            Tags = { ["operation"] = "group_update_all_versions" },
-        });
 
         // track original contents for later handling
         async Task TrackOriginalContentsAsync(string directory, string fileName)
@@ -132,6 +135,7 @@ public class RunWorker
             var localFullPath = Path.Join(repoContentsPath.FullName, repoFullPath);
             var content = await File.ReadAllTextAsync(localFullPath);
             originalDependencyFileContents[repoFullPath] = content;
+            originalDependencyFileEOFs[repoFullPath] = content.GetPredominantEOL();
         }
 
         foreach (var project in discoveryResult.Projects)
@@ -143,63 +147,78 @@ public class RunWorker
                 var extraFilePath = Path.Join(projectDirectory, extraFile);
                 await TrackOriginalContentsAsync(discoveryResult.Path, extraFilePath);
             }
-            // TODO: include global.json, etc.
+        }
+
+        var nonProjectFiles = new[]
+        {
+            discoveryResult.GlobalJson?.FilePath,
+            discoveryResult.DotNetToolsJson?.FilePath,
+        }.Where(f => f is not null).Cast<string>().ToArray();
+        foreach (var nonProjectFile in nonProjectFiles)
+        {
+            await TrackOriginalContentsAsync(discoveryResult.Path, nonProjectFile);
         }
 
         // do update
-        _logger.Info($"Running update in directory {repoDirectory}");
-        foreach (var project in discoveryResult.Projects)
+        var updateOperations = GetUpdateOperations(discoveryResult).ToArray();
+        var allowedUpdateOperations = updateOperations.Where(u => IsUpdateAllowed(job, u.Dependency)).ToArray();
+
+        // requested update isn't listed => SecurityUpdateNotNeeded
+        var expectedSecurityUpdateDependencyNames = job.SecurityAdvisories
+            .Select(s => s.DependencyName)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var actualUpdateDependencyNames = allowedUpdateOperations
+            .Select(u => u.Dependency.Name)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var expectedDependencyUpdateMissingInActual = expectedSecurityUpdateDependencyNames
+            .Except(actualUpdateDependencyNames, StringComparer.OrdinalIgnoreCase)
+            .OrderBy(d => d, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+        foreach (var missingSecurityUpdate in expectedDependencyUpdateMissingInActual)
         {
-            foreach (var dependency in project.Dependencies)
+            await _apiHandler.RecordUpdateJobError(new SecurityUpdateNotNeeded(missingSecurityUpdate));
+        }
+
+        foreach (var updateOperation in allowedUpdateOperations)
+        {
+            var dependency = updateOperation.Dependency;
+            _logger.Info($"Updating [{dependency.Name}] in [{updateOperation.FilePath}]");
+
+            var dependencyInfo = GetDependencyInfo(job, dependency);
+            var analysisResult = await _analyzeWorker.RunAsync(repoContentsPath.FullName, discoveryResult, dependencyInfo);
+            // TODO: log analysisResult
+            if (analysisResult.CanUpdate)
             {
-                if (!IsUpdateAllowed(job, dependency))
+                // TODO: this is inefficient, but not likely causing a bottleneck
+                var previousDependency = discoveredUpdatedDependencies.Dependencies
+                    .Single(d => d.Name == dependency.Name && d.Requirements.Single().File == updateOperation.FilePath);
+                var updatedDependency = new ReportedDependency()
                 {
-                    continue;
-                }
-
-                var dependencyInfo = GetDependencyInfo(job, dependency);
-                var analysisResult = await _analyzeWorker.RunAsync(repoContentsPath.FullName, discoveryResult, dependencyInfo);
-                // TODO: log analysisResult
-                if (analysisResult.CanUpdate)
-                {
-                    var dependencyLocation = Path.Join(discoveryResult.Path, project.FilePath).FullyNormalizedRootedPath();
-
-                    // TODO: this is inefficient, but not likely causing a bottleneck
-                    var previousDependency = discoveredUpdatedDependencies.Dependencies
-                        .Single(d => d.Name == dependency.Name && d.Requirements.Single().File == dependencyLocation);
-                    var updatedDependency = new ReportedDependency()
-                    {
-                        Name = dependency.Name,
-                        Version = analysisResult.UpdatedVersion,
-                        Requirements =
-                        [
-                            new ReportedRequirement()
-                            {
-                                File = dependencyLocation,
-                                Requirement = analysisResult.UpdatedVersion,
-                                Groups = previousDependency.Requirements.Single().Groups,
-                                Source = new RequirementSource()
-                                {
-                                    SourceUrl = analysisResult.UpdatedDependencies.FirstOrDefault(d => d.Name == dependency.Name)?.InfoUrl,
-                                },
-                            }
-                        ],
-                        PreviousVersion = dependency.Version,
-                        PreviousRequirements = previousDependency.Requirements,
-                    };
-
-                    var dependencyFilePath = Path.Join(discoveryResult.Path, project.FilePath).FullyNormalizedRootedPath();
-                    var updateResult = await _updaterWorker.RunAsync(repoContentsPath.FullName, dependencyFilePath, dependency.Name, dependency.Version!, analysisResult.UpdatedVersion, isTransitive: dependency.IsTransitive);
-                    // TODO: need to report if anything was actually updated
-                    if (updateResult.Error is null)
-                    {
-                        if (dependencyLocation != dependencyFilePath)
+                    Name = dependency.Name,
+                    Version = analysisResult.UpdatedVersion,
+                    Requirements =
+                    [
+                        new ReportedRequirement()
                         {
-                            updatedDependency.Requirements.All(r => r.File == dependencyFilePath);
+                            File = updateOperation.FilePath,
+                            Requirement = analysisResult.UpdatedVersion,
+                            Groups = previousDependency.Requirements.Single().Groups,
+                            Source = new RequirementSource()
+                            {
+                                SourceUrl = analysisResult.UpdatedDependencies.FirstOrDefault(d => d.Name == dependency.Name)?.InfoUrl,
+                            },
                         }
+                    ],
+                    PreviousVersion = dependency.Version,
+                    PreviousRequirements = previousDependency.Requirements,
+                };
 
-                        actualUpdatedDependencies.Add(updatedDependency);
-                    }
+                var updateResult = await _updaterWorker.RunAsync(repoContentsPath.FullName, updateOperation.FilePath, dependency.Name, dependency.Version!, analysisResult.UpdatedVersion, isTransitive: dependency.IsTransitive);
+                // TODO: need to report if anything was actually updated
+                if (updateResult.Error is null)
+                {
+                    actualUpdatedDependencies.Add(updatedDependency);
                 }
             }
         }
@@ -212,6 +231,10 @@ public class RunWorker
             var localFullPath = Path.GetFullPath(Path.Join(repoContentsPath.FullName, repoFullPath));
             var originalContent = originalDependencyFileContents[repoFullPath];
             var updatedContent = await File.ReadAllTextAsync(localFullPath);
+
+            updatedContent = updatedContent.SetEOL(originalDependencyFileEOFs[repoFullPath]);
+            await File.WriteAllTextAsync(localFullPath, updatedContent);
+
             if (updatedContent != originalContent)
             {
                 updatedDependencyFiles[localFullPath] = new DependencyFile()
@@ -232,7 +255,11 @@ public class RunWorker
                 var extraFilePath = Path.Join(projectDirectory, extraFile);
                 await AddUpdatedFileIfDifferentAsync(discoveryResult.Path, extraFilePath);
             }
-            // TODO: handle global.json, etc.
+        }
+
+        foreach (var nonProjectFile in nonProjectFiles)
+        {
+            await AddUpdatedFileIfDifferentAsync(discoveryResult.Path, nonProjectFile);
         }
 
         if (updatedDependencyFiles.Count > 0)
@@ -273,6 +300,68 @@ public class RunWorker
             BaseCommitSha = baseCommitSha,
         };
         return result;
+    }
+
+    internal static IEnumerable<(string FilePath, Dependency Dependency)> GetUpdateOperations(WorkspaceDiscoveryResult discovery)
+    {
+        // discovery is grouped by project/file then dependency, but we want to pivot and return a list of update operations sorted by dependency name then file path
+
+        var updateOrder = new Dictionary<string, Dictionary<string, Dictionary<string, Dependency>>>(StringComparer.OrdinalIgnoreCase);
+        //                     <dependency name,        <file path, specific dependencies>>
+
+        // collect
+        void CollectDependenciesForFile(string filePath, IEnumerable<Dependency> dependencies)
+        {
+            foreach (var dependency in dependencies)
+            {
+                var dependencyGroup = updateOrder.GetOrAdd(dependency.Name, () => new Dictionary<string, Dictionary<string, Dependency>>(PathComparer.Instance));
+                var dependenciesForFile = dependencyGroup.GetOrAdd(filePath, () => new Dictionary<string, Dependency>(StringComparer.OrdinalIgnoreCase));
+                dependenciesForFile[dependency.Name] = dependency;
+            }
+        }
+        foreach (var project in discovery.Projects)
+        {
+            var projectPath = Path.Join(discovery.Path, project.FilePath).FullyNormalizedRootedPath();
+            CollectDependenciesForFile(projectPath, project.Dependencies);
+        }
+
+        if (discovery.GlobalJson is not null)
+        {
+            var globalJsonPath = Path.Join(discovery.Path, discovery.GlobalJson.FilePath).FullyNormalizedRootedPath();
+            CollectDependenciesForFile(globalJsonPath, discovery.GlobalJson.Dependencies);
+        }
+
+        if (discovery.DotNetToolsJson is not null)
+        {
+            var dotnetToolsJsonPath = Path.Join(discovery.Path, discovery.DotNetToolsJson.FilePath).FullyNormalizedRootedPath();
+            CollectDependenciesForFile(dotnetToolsJsonPath, discovery.DotNetToolsJson.Dependencies);
+        }
+
+        // return
+        foreach (var dependencyName in updateOrder.Keys.OrderBy(k => k, StringComparer.OrdinalIgnoreCase))
+        {
+            var fileDependencies = updateOrder[dependencyName];
+            foreach (var filePath in fileDependencies.Keys.OrderBy(p => p, PathComparer.Instance))
+            {
+                var dependencies = fileDependencies[filePath];
+                var dependency = dependencies[dependencyName];
+                yield return (filePath, dependency);
+            }
+        }
+    }
+
+    internal static IncrementMetric GetIncrementMetric(Job job)
+    {
+        var isSecurityUpdate = job.AllowedUpdates.Any(a => a.UpdateType == UpdateType.Security) || job.SecurityUpdatesOnly;
+        var metricOperation = isSecurityUpdate ?
+            (job.UpdatingAPullRequest ? "update_security_pr" : "create_security_pr")
+            : (job.UpdatingAPullRequest ? "update_version_pr" : "group_update_all_versions");
+        var increment = new IncrementMetric()
+        {
+            Metric = "updater.started",
+            Tags = { ["operation"] = metricOperation },
+        };
+        return increment;
     }
 
     internal static bool IsUpdateAllowed(Job job, Dependency dependency)
@@ -403,30 +492,69 @@ public class RunWorker
             }
         }
 
+        var allDependenciesWithFilePath = discoveryResult.Projects.SelectMany(p =>
+        {
+            return p.Dependencies
+                .Where(d => d.Version is not null)
+                .Select(d =>
+                    (p.FilePath, new ReportedDependency()
+                    {
+                        Name = d.Name,
+                        Requirements = [new ReportedRequirement()
+                            {
+                                File = GetFullRepoPath(p.FilePath),
+                                Requirement = d.Version!,
+                                Groups = ["dependencies"],
+                            }],
+                        Version = d.Version,
+                    }));
+        }).ToList();
+
+        var nonProjectDependencySet = new (string?, IEnumerable<Dependency>)[]
+        {
+            (discoveryResult.GlobalJson?.FilePath, discoveryResult.GlobalJson?.Dependencies ?? []),
+            (discoveryResult.DotNetToolsJson?.FilePath, discoveryResult.DotNetToolsJson?.Dependencies ?? []),
+        };
+
+        foreach (var (filePath, dependencies) in nonProjectDependencySet)
+        {
+            if (filePath is null)
+            {
+                continue;
+            }
+
+            allDependenciesWithFilePath.AddRange(dependencies
+                .Where(d => d.Version is not null)
+                .Select(d =>
+                    (filePath, new ReportedDependency()
+                    {
+                        Name = d.Name,
+                        Requirements = [new ReportedRequirement()
+                            {
+                                File = GetFullRepoPath(filePath),
+                                Requirement = d.Version!,
+                                Groups = ["dependencies"],
+                            }],
+                        Version = d.Version,
+                    })));
+        }
+
+        var sortedDependencies = allDependenciesWithFilePath
+            .OrderBy(pair => Path.Join(discoveryResult.Path, pair.FilePath).FullyNormalizedRootedPath(), PathComparer.Instance)
+            .ThenBy(pair => pair.Item2.Name, StringComparer.OrdinalIgnoreCase)
+            .Select(pair => pair.Item2)
+            .ToArray();
+
         var dependencyFiles = discoveryResult.Projects
             .Select(p => GetFullRepoPath(p.FilePath))
             .Concat(auxiliaryFiles)
             .Distinct()
             .OrderBy(p => p)
             .ToArray();
+
         var updatedDependencyList = new UpdatedDependencyList()
         {
-            Dependencies = discoveryResult.Projects.SelectMany(p =>
-            {
-                return p.Dependencies.Where(d => d.Version is not null).Select(d =>
-                    new ReportedDependency()
-                    {
-                        Name = d.Name,
-                        Requirements = [new ReportedRequirement()
-                        {
-                            File = GetFullRepoPath(p.FilePath),
-                            Requirement = d.Version!,
-                            Groups = ["dependencies"],
-                        }],
-                        Version = d.Version,
-                    }
-                );
-            }).ToArray(),
+            Dependencies = sortedDependencies,
             DependencyFiles = dependencyFiles,
         };
         return updatedDependencyList;

@@ -32,11 +32,13 @@
 # - elm
 # - submodules
 # - docker
+# - docker_compose
 # - terraform
 # - pub
 # - swift
 # - devcontainers
 # - dotnet_sdk
+# - bun
 
 # rubocop:disable Style/GlobalVars
 
@@ -50,12 +52,14 @@ unless Etc.getpwuid(Process.uid).name == "dependabot" || ENV["ALLOW_DRY_RUN_STAN
   exit 1
 end
 
+$LOAD_PATH << "./bun/lib"
 $LOAD_PATH << "./bundler/lib"
 $LOAD_PATH << "./cargo/lib"
 $LOAD_PATH << "./common/lib"
 $LOAD_PATH << "./composer/lib"
 $LOAD_PATH << "./devcontainers/lib"
 $LOAD_PATH << "./docker/lib"
+$LOAD_PATH << "./docker_compose/lib"
 $LOAD_PATH << "./dotnet_sdk/lib"
 $LOAD_PATH << "./elm/lib"
 $LOAD_PATH << "./git_submodules/lib"
@@ -70,6 +74,7 @@ $LOAD_PATH << "./python/lib"
 $LOAD_PATH << "./pub/lib"
 $LOAD_PATH << "./swift/lib"
 $LOAD_PATH << "./terraform/lib"
+$LOAD_PATH << "./uv/lib"
 
 updater_image_gemfile = File.expand_path("../dependabot-updater/Gemfile", __dir__)
 updater_repo_gemfile = File.expand_path("../updater/Gemfile", __dir__)
@@ -97,11 +102,13 @@ require "dependabot/pull_request_creator"
 require "dependabot/config/file_fetcher"
 require "dependabot/simple_instrumentor"
 
+require "dependabot/bun"
 require "dependabot/bundler"
 require "dependabot/cargo"
 require "dependabot/composer"
 require "dependabot/devcontainers"
 require "dependabot/docker"
+require "dependabot/docker_compose"
 require "dependabot/dotnet_sdk"
 require "dependabot/elm"
 require "dependabot/git_submodules"
@@ -116,6 +123,7 @@ require "dependabot/python"
 require "dependabot/pub"
 require "dependabot/swift"
 require "dependabot/terraform"
+require "dependabot/uv"
 
 # GitHub credentials with write permission to the repo you want to update
 # (so that you can create a new branch, commit and pull request).
